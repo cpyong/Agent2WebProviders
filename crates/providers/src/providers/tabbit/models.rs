@@ -8,9 +8,9 @@
 //! 1. 上游 `selected_model` 只认 **display_name**：发我们对外用的 slug 会被
 //!    静默换成别的模型（不报错，答非所问）。所以对外 id 是 slug，发上游时
 //!    一律换回 `upstreamModel`。
-//! 2. 本适配器只做纯文本：`supportsImages` 与 `supportsToolCall` 恒 false。
-//!    网页 completion 没有原生工具调用契约，按 Web 包的口径明确拒绝，
-//!    不用提示词模拟（与 DeepSeek 网页一致）。
+//! 2. 本适配器只做纯文本：`supportsImages` 恒 false。工具调用是**提示词级
+//!    桥接**（见 `tools.rs`），所以 `supportsToolCall` 为 true，同时用
+//!    `toolCallEmulated` 标明它不是上游原生能力。
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -51,7 +51,8 @@ pub fn fallback_for(realm: Realm) -> Vec<Value> {
         "upstreamModel": DEFAULT_MODEL,
         "isDefault": true,
         "supportsImages": false,
-        "supportsToolCall": false,
+        "supportsToolCall": true,
+        "toolCallEmulated": true,
         "supportsReasoning": true,
         "inputModalities": ["text"],
         "synthetic": true,
@@ -160,7 +161,8 @@ fn parse_catalog(value: &Value, realm: Realm) -> Result<Catalog, GatewayError> {
             "name": name,
             "isDefault": false,
             "supportsImages": false,
-            "supportsToolCall": false,
+            "supportsToolCall": true,
+            "toolCallEmulated": true,
             "supportsReasoning": flag(entry, &["support_thinking", "supports_thinking", "support_reasoning"]),
             "inputModalities": ["text"],
             "upstreamModel": name,

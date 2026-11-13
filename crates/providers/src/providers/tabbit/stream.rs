@@ -20,9 +20,20 @@
 //! head 之前先读到「第一条正文或错误」；读到错误就把整次请求作为控制面
 //! 错误返回（网关据此换号），读到正文才发 200 并开始逐帧转发。
 //!
-//! ── 不做工具调用模拟 ────────────────────────────────────────
-//! 网页 completion 没有原生 tool_calls，本适配器按 Web 包口径明确拒绝
-//! tools（见 `prompt.rs`），因此这里没有工具标记扫描器。
+//! ── 工具调用：出流门控 ──────────────────────────────────────
+//! 上游没有原生 `tool_calls`，模型把调用写成 `<tool_call>…</tool_call>`
+//! （协议见 `tools.rs`）。这里不能「先原样吐出去再补一个 tool_calls」——
+//! 客户端已经收到的正文无法撤回。所以正文走一道门控（[`Gate`]）：
+//!
+//! - 平时带 `HOLD_BACK` 字的尾巴延迟发出，尾巴里万一出现标记就能整段扣下；
+//! - 命中硬标记（`<tool_call>` / ` ```tool_call `）就转「抑制」；软标记
+//!   （` ```json ` / 裸 `{"name"`）只在还没发出任何正文时才认，避免把讲
+//!   JSON 的正常回答也拦下来（见 [`SOFT_MARKERS`]）；
+//! - 流结束时解析成功 → 发 `delta.tool_calls` + `finish_reason: "tool_calls"`；
+//!   解析失败 → 把缓冲的正文补发出去，当普通回答收尾（**不报 5xx**）。
+//!
+//! 首字符是 `{` / `[` 的响应直接全程缓冲：那是「整段 JSON」形态的调用，
+//! 提前发出去就等于把调用当正文吐给客户端。
 
 use agent2api_provider_protocol as proto;
 use agent2api_provider_sdk::ConversationSink;
@@ -30,6 +41,10 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use super::sign;
+use super::tools::{self, Bridge};
+
+/// 正文尾巴的保留字数：要盖得住最长标记（`<tool_call>` 11 字、围栏 13 字）。
+const HOLD_BACK: usize = 48;
 
 /// 一条 SSE 事件。
 struct Event {
@@ -45,6 +60,204 @@ enum Action {
     Done(Vec<Value>),
 }
 
+/// 正文门控：决定哪些字能立刻发、哪些要扣下来等解析。
+struct Gate {
+    bridge: Bridge,
+    buf: String,
+    emitted: usize,
+    suppressed: bool,
+    decided: bool,
+}
+
+/// 硬标记：一出现就说明这是工具调用，立刻停止发正文。
+/// `<tool_call>` / ` ```tool_call ` 不会是正常回答里的措辞，误判风险为零。
+const HARD_MARKERS: [&str; 2] = [tools::OPEN_TAG, "```tool_call"];
+/// 软标记：` ```json ` / 裸的 `{"name"`。正常回答（尤其讲配置、贴 JSON）
+/// 里也会出现，所以只在**一个字都还没发出去**时才认 —— 那才是「模型整段
+/// 只回了一个调用」的形态。正文中途出现的软标记不动，照常流式输出。
+const SOFT_MARKERS: [&str; 3] = ["```json", "{\"name\"", "{\"tool_calls\""];
+
+fn floor_boundary(text: &str, index: usize) -> usize {
+    let mut at = index.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// 在 `text` 里找最早的标记，返回绝对字节下标。
+fn marker_at(text: &str, allow_soft: bool) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let mut markers: Vec<&str> = HARD_MARKERS.to_vec();
+    if allow_soft {
+        markers.extend(SOFT_MARKERS);
+    }
+    markers
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+}
+
+impl Gate {
+    fn new(bridge: Bridge) -> Self {
+        Self {
+            bridge,
+            buf: String::new(),
+            emitted: 0,
+            suppressed: false,
+            decided: false,
+        }
+    }
+
+    /// 追加一段增量，返回**现在就可以当正文发出去**的片段。
+    fn push(&mut self, text: &str) -> Vec<String> {
+        self.buf.push_str(text);
+        if self.suppressed {
+            return Vec::new();
+        }
+        if !self.decided {
+            match self.buf.chars().find(|ch| !ch.is_whitespace()) {
+                // 整段 JSON 形态：全程缓冲，结束时再判。
+                Some('{') | Some('[') => {
+                    self.suppressed = true;
+                    return Vec::new();
+                }
+                Some(_) => self.decided = true,
+                None => return Vec::new(),
+            }
+        }
+        // 只在 emit 之后那一段里找：hold 窗口 ≥ 最长标记，标记不可能跨过
+        // emitted 边界，所以从 emitted 起搜既正确又把开销压到 O(窗口)。
+        if let Some(offset) = marker_at(&self.buf[self.emitted..], self.emitted == 0) {
+            let at = self.emitted + offset;
+            self.suppressed = true;
+            if at > self.emitted {
+                let piece = self.buf[self.emitted..at].to_string();
+                self.emitted = at;
+                return vec![piece];
+            }
+            return Vec::new();
+        }
+        let safe = floor_boundary(&self.buf, self.buf.len().saturating_sub(HOLD_BACK));
+        if safe > self.emitted {
+            let piece = self.buf[self.emitted..safe].to_string();
+            self.emitted = safe;
+            return vec![piece];
+        }
+        Vec::new()
+    }
+
+    /// 收尾：返回「还没发出去的正文」与解析出的调用。
+    fn finish(&mut self) -> (Vec<String>, Vec<Value>) {
+        let outcome = self.bridge.parse(&self.buf);
+        if !outcome.calls.is_empty() {
+            // 已经流出去的正文保留（通常是「我先看下文件」这类铺垫）。
+            let leftover = if self.emitted == 0 && !outcome.content.is_empty() {
+                vec![outcome.content]
+            } else {
+                Vec::new()
+            };
+            return (leftover, outcome.calls);
+        }
+        let rest = self.buf.get(self.emitted..).unwrap_or("").to_string();
+        if rest.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            (vec![rest], Vec::new())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate() -> Gate {
+        let body = json!({
+            "tools": [{"type": "function", "function": {
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }}]
+        });
+        Gate::new(Bridge::from_body(&body).expect("bridge"))
+    }
+
+    fn feed(gate: &mut Gate, parts: &[&str]) -> String {
+        let mut out = String::new();
+        for part in parts {
+            for piece in gate.push(part) {
+                out.push_str(&piece);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn plain_text_is_flushed_at_finish() {
+        let mut gate = gate();
+        assert_eq!(feed(&mut gate, &["你好", "，世界"]), "");
+        let (leftover, calls) = gate.finish();
+        assert_eq!(leftover.join(""), "你好，世界");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn preamble_before_tag_is_streamed() {
+        let mut gate = gate();
+        let streamed = feed(
+            &mut gate,
+            &[
+                "我先读一下文件。\n",
+                "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>",
+            ],
+        );
+        assert_eq!(streamed, "我先读一下文件。\n");
+        let (leftover, calls) = gate.finish();
+        assert!(leftover.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn leading_json_buffers_whole_reply() {
+        let mut gate = gate();
+        let streamed = feed(
+            &mut gate,
+            &["{\"name\":\"read_file\",", "\"arguments\":{\"path\":\"b.txt\"}}"],
+        );
+        assert_eq!(streamed, "");
+        let (leftover, calls) = gate.finish();
+        assert!(leftover.is_empty());
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn soft_marker_false_positive_keeps_text() {
+        let mut gate = gate();
+        let text = "配置长这样：\n```json\n{\"name\":\"demo\"}\n```\n就是这样。";
+        let streamed = feed(&mut gate, &[text]);
+        let (leftover, calls) = gate.finish();
+        assert!(calls.is_empty());
+        assert_eq!(format!("{streamed}{}", leftover.join("")), text);
+    }
+
+    #[test]
+    fn long_answer_streams_before_tool_call() {
+        let mut gate = gate();
+        let long = "这是一段很长的解释，用来确认门控只在保留窗口内拦截标记。".repeat(8);
+        let streamed = feed(&mut gate, &[long.as_str()]);
+        assert!(streamed.chars().count() > long.chars().count() - HOLD_BACK);
+        assert!(streamed.chars().count() < long.chars().count());
+        let (leftover, calls) = gate.finish();
+        assert!(calls.is_empty());
+        assert_eq!(
+            format!("{streamed}{}", leftover.join("")),
+            long,
+            "正文不能多也不能少"
+        );
+    }
+}
+
 struct State {
     id: String,
     created: i64,
@@ -52,6 +265,8 @@ struct State {
     started: bool,
     finished: bool,
     usage: Option<Value>,
+    /// 有工具声明时做正文门控；没有就直通。
+    gate: Option<Gate>,
 }
 
 impl State {
@@ -63,7 +278,13 @@ impl State {
             started: false,
             finished: false,
             usage: None,
+            gate: None,
         }
+    }
+
+    fn with_tools(mut self, bridge: Option<Bridge>) -> Self {
+        self.gate = bridge.map(Gate::new);
+        self
     }
 
     fn chunk(&self, delta: Value, finish: Option<&str>) -> Value {
@@ -84,12 +305,22 @@ impl State {
         out.push(self.chunk(json!({ "role": "assistant", "content": "" }), None));
     }
 
+    /// 正文增量：有门控时先过闸，闸口只放安全的部分出来。
     fn content(&mut self, text: &str, out: &mut Vec<Value>) {
         if text.is_empty() {
             return;
         }
-        self.ensure_role(out);
-        out.push(self.chunk(json!({ "content": text }), None));
+        let pieces = match self.gate.as_mut() {
+            Some(gate) => gate.push(text),
+            None => vec![text.to_string()],
+        };
+        for piece in pieces {
+            if piece.is_empty() {
+                continue;
+            }
+            self.ensure_role(out);
+            out.push(self.chunk(json!({ "content": piece }), None));
+        }
     }
 
     fn reasoning(&mut self, text: &str, out: &mut Vec<Value>) {
@@ -106,9 +337,39 @@ impl State {
         }
         self.finished = true;
         let mut out = Vec::new();
+        let mut reason = reason.to_string();
+        if let Some(mut gate) = self.gate.take() {
+            let (leftover, calls) = gate.finish();
+            for piece in leftover {
+                if piece.is_empty() {
+                    continue;
+                }
+                self.ensure_role(&mut out);
+                out.push(self.chunk(json!({ "content": piece }), None));
+            }
+            if !calls.is_empty() {
+                self.ensure_role(&mut out);
+                for (index, call) in calls.iter().enumerate() {
+                    out.push(self.chunk(
+                        json!({ "tool_calls": [{
+                            "index": index,
+                            "id": call.get("id").cloned().unwrap_or(Value::Null),
+                            "type": "function",
+                            "function": call.get("function").cloned().unwrap_or(Value::Null),
+                        }]}),
+                        None,
+                    ));
+                }
+                reason = "tool_calls".to_string();
+            }
+        }
         self.ensure_role(&mut out);
-        let reason = if reason.is_empty() { "stop" } else { reason };
-        out.push(self.chunk(json!({}), Some(reason)));
+        let reason = if reason.is_empty() {
+            "stop".to_string()
+        } else {
+            reason
+        };
+        out.push(self.chunk(json!({}), Some(&reason)));
         if let Some(usage) = self.usage.clone() {
             out.push(json!({
                 "id": self.id,
@@ -190,6 +451,16 @@ fn error_status(raw: &str, message: &str) -> u16 {
     502
 }
 
+fn chunks_or_idle(out: Vec<Value>) -> Action {
+    // 空产出当「忽略」而不是「有正文」：否则首帧窥探会在还没读到任何字时
+    // 就退出，把紧随其后的错误帧当正文流出去。
+    if out.is_empty() {
+        Action::Ignore
+    } else {
+        Action::Chunks(out)
+    }
+}
+
 fn translate(event: &Event, run_id: &str, state: &mut State) -> Action {
     let raw = event.data.trim();
     if raw.is_empty() || raw == "[DONE]" {
@@ -233,7 +504,7 @@ fn translate(event: &Event, run_id: &str, state: &mut State) -> Action {
                             &text_of(chunk, &["reasoning_content", "content"]),
                             &mut out,
                         );
-                        Action::Chunks(out)
+                        chunks_or_idle(out)
                     }
                     "thinking_finished" => Action::Ignore,
                     "error" => {
@@ -243,7 +514,7 @@ fn translate(event: &Event, run_id: &str, state: &mut State) -> Action {
                     _ => {
                         let mut out = Vec::new();
                         state.content(&text_of(chunk, &["content"]), &mut out);
-                        Action::Chunks(out)
+                        chunks_or_idle(out)
                     }
                 };
             }
@@ -256,7 +527,7 @@ fn translate(event: &Event, run_id: &str, state: &mut State) -> Action {
                 }
                 let mut out = Vec::new();
                 state.content(&text, &mut out);
-                return Action::Chunks(out);
+                return chunks_or_idle(out);
             }
             "assistant_message_finished" => return Action::Ignore,
             "run_completed" => {
@@ -306,7 +577,7 @@ fn translate(event: &Event, run_id: &str, state: &mut State) -> Action {
         "thinking" => {
             let mut out = Vec::new();
             state.reasoning(&text_of(&payload, &["reasoning_content", "content", "text"]), &mut out);
-            Action::Chunks(out)
+            chunks_or_idle(out)
         }
         "message_chunk" | "message" | "delta" => {
             let mut text = text_of(&payload, &["content", "text", "delta"]);
@@ -317,7 +588,7 @@ fn translate(event: &Event, run_id: &str, state: &mut State) -> Action {
             }
             let mut out = Vec::new();
             state.content(&text, &mut out);
-            Action::Chunks(out)
+            chunks_or_idle(out)
         }
         "usage" => {
             if let Some(usage) = usage_of(&payload) {
@@ -442,12 +713,13 @@ pub async fn forward(
     response: reqwest::Response,
     run_id: String,
     model: String,
+    bridge: Option<Bridge>,
     sink: &mut ConversationSink<'_>,
 ) -> Result<(), String> {
     let mut source = Box::pin(response.bytes_stream());
     let mut buffer: Vec<u8> = Vec::new();
     let mut eof = false;
-    let mut state = State::new(&model);
+    let mut state = State::new(&model).with_tools(bridge);
 
     // ── 先窥到第一条正文 / 错误 / 结束（最多 64 帧控制事件）──
     let mut ready: Vec<Value> = Vec::new();

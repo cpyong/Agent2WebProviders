@@ -19,9 +19,11 @@
 //! JWT 7 天有效，上游没有 refresh 端点，`refresh` 能力位为 false。过期只能
 //! 重新导出 Cookie；账号行会显示有效期，不假装能自动续期。
 //!
-//! ── 工具调用 ────────────────────────────────────────────────
-//! 上游没有原生 `tool_calls`，本适配明确拒绝 `tools`（不写提示词模拟），
-//! 与 Web 包的 DeepSeek 网页同一口径。模型目录的 `supportsToolCall` 恒 false。
+//! ── 工具调用：提示词级桥接 ──────────────────────────────────
+//! 上游没有原生 `tool_calls`，但 Cursor 这类 Agent 客户端每次请求都带 `tools`，
+//! 直接拒绝等于在 Agent 里不可用。本适配按 `tools.rs` 的协议做**显式桥接**：
+//! 声明写进提示词 → 模型输出 `<tool_call>` 标签 → 解析回标准 `tool_calls`。
+//! 模型目录里 `supportsToolCall` 为 true，并标 `toolCallEmulated` 区分原生能力。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! 本 crate 编译期禁止 unwrap/expect/panic（见 `main.rs` 的 deny）。
@@ -35,6 +37,7 @@ pub mod models;
 pub mod prompt;
 pub mod sign;
 pub mod stream;
+pub mod tools;
 pub mod usage;
 
 use agent2api_provider_protocol as proto;
@@ -75,7 +78,7 @@ async fn prepare(
         .await
         .map_err(|error| control_message(401, format!("读取 Tabbit 账号失败：{error}")))?;
     let creds = client::Credentials::from_secret(&record.secret).map_err(control)?;
-    let prompt = prompt::build(&req.body).map_err(control)?;
+    let prepared = prompt::build(&req.body).map_err(control)?;
     let http = client::client_for(req.proxy.as_ref(), &ctx.env.proxy)
         .map_err(|error| control_message(502, error))?;
     let requested = if req.wire_model.is_empty() {
@@ -111,10 +114,12 @@ async fn prepare(
             }
             Err(error) => return Err(control(error)),
         };
-        let run_body = client::build_run_payload(&prompt, &upstream_model);
+        let run_body = client::build_run_payload(&prepared.text, &upstream_model);
         match client::post_run(&creds, realm, &session, &run_body, &http).await {
             Ok(run_id) => {
-                return stream::forward(response, run_id, display_model, sink).await;
+                // 桥接上下文 Clone 一份：409 重试时循环还会再走一遍。
+                let bridge = prepared.bridge.clone();
+                return stream::forward(response, run_id, display_model, bridge, sink).await;
             }
             Err(error) if error.status_code == 409 && attempt == 0 => {
                 drop(response);

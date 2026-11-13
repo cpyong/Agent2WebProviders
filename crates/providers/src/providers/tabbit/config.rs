@@ -4,6 +4,31 @@
 //! 登录态不通用、签名 key 不同、目录与额度各按站点计。因此它们是两个
 //! provider（`tabbit` / `tabbit-intl`），不是同一个 provider 上的地区字段。
 
+use std::sync::OnceLock;
+
+/// 上游根地址。默认是两个正式域名；`TABBIT_BASE_CN` / `TABBIT_BASE_INTL`
+/// 可覆盖（离线冒烟测试指向本机假上游，不必改代码就能跑通全链路）。
+fn cn_base() -> &'static str {
+    static BASE: OnceLock<Option<String>> = OnceLock::new();
+    BASE.get_or_init(|| env_base("TABBIT_BASE_CN"))
+        .as_deref()
+        .unwrap_or("https://web.tabbit.com")
+}
+
+fn intl_base() -> &'static str {
+    static BASE: OnceLock<Option<String>> = OnceLock::new();
+    BASE.get_or_init(|| env_base("TABBIT_BASE_INTL"))
+        .as_deref()
+        .unwrap_or("https://web.tabbit.ai")
+}
+
+fn env_base(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// 国内站 provider id（落盘契约，不能改）。
 pub const ID_CN: &str = "tabbit";
 /// 国际站 provider id（落盘契约，不能改）。
@@ -35,8 +60,8 @@ impl Realm {
 
     pub fn base(self) -> &'static str {
         match self {
-            Realm::Cn => "https://web.tabbit.com",
-            Realm::Intl => "https://web.tabbit.ai",
+            Realm::Cn => cn_base(),
+            Realm::Intl => intl_base(),
         }
     }
 
@@ -62,6 +87,10 @@ pub const DEFAULT_MODEL: &str = "default";
 
 /// 一次请求送上游的字符预算（实测 20000 字符成功、25000 必失败，取 16000 留余量）。
 pub const PROMPT_BUDGET: usize = 16000;
+/// 带工具声明时的预算：工具协议段要额外占位，但仍留在实测成功区间内。
+pub const PROMPT_BUDGET_WITH_TOOLS: usize = 18000;
+/// 工具协议段（说明 + 压缩 schema）的字符上限。
+pub const TOOL_BUDGET: usize = 7000;
 /// 单条消息的字符上限。
 pub const PROMPT_SINGLE: usize = 9000;
 /// 系统指令的字符上限。

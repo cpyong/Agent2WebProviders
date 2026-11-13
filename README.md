@@ -17,8 +17,8 @@ The table describes the current implementation. It does not imply that every cap
 | --- | :--: | :--: | :--: | :--: | :--: | :--: |
 | Zhipu Qingyan | ✓ | ✓ | Online + fallback | Signed-in accounts | Signed-in accounts | Signed-in accounts |
 | DeepSeek Web | Text + image input; no tool calls | Undeclared | Online configuration + fallback | Undeclared | Undeclared | Undeclared |
-| Tabbit (China) | Text; no tool calls | ✗ (7-day JWT, re-import) | Online + fallback | Percentage | ✓ | — |
-| Tabbit (International) | Text; no tool calls | ✗ (7-day JWT, re-import) | Online + fallback | Percentage | ✓ | — |
+| Tabbit (China) | Text; prompt-level tool calls | ✗ (7-day JWT, re-import) | Online + fallback | Percentage | ✓ | — |
+| Tabbit (International) | Text; prompt-level tool calls | ✗ (7-day JWT, re-import) | Online + fallback | Percentage | ✓ | — |
 
 “Undeclared” means the capability has not been confirmed or integrated; it does not establish that the upstream service lacks it.
 
@@ -46,7 +46,7 @@ The table describes the current implementation. It does not imply that every cap
 - Two providers: `tabbit` for `web.tabbit.com` (China) and `tabbit-intl` for `web.tabbit.ai` (international). Tokens and signing keys are not interchangeable between the two sites.
 - The China site supports phone + SMS-code login (recommended) as well as importing an existing web login state (token + user_id in the Cookie, or the DevTools Copy as cURL of a request). The international site has no reproducible web-auth callback, and phone login is still in upstream rollout, so only an existing login state can be imported.
 - The upstream uses the v3 room protocol: create session → join for SSE → post runs. Replies are translated from its events.
-- Text only. There is no native tool-calling contract: `tools` requests are rejected explicitly, and image input is not wired yet.
+- Text input only. The upstream has no native tool-calling contract, so the plugin bridges tools at prompt level: declarations go into the prompt, the model answers with `tool_call` tags, and they are parsed back into standard `tool_calls`. Models are marked `toolCallEmulated`. Complex agent loops are less reliable than a native tool API, and image input is not wired yet.
 - No refresh endpoint: the JWT lasts about 7 days; re-import it after expiry.
 - Quota is percentage-based (used %, member level, reset time). Daily check-in uses the real `daily_sign_in` endpoint.
 - `unlockPro` (default on) sends the "set as default browser" marker in `unique-uuid` to unlock Premium models. Turning it off may make Premium models return 492.
